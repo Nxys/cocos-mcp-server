@@ -182,6 +182,18 @@ export class MCPServer {
         try {
             if (pathname === '/mcp' && req.method === 'POST') {
                 await this.handleMCPRequest(req, res);
+            } else if (pathname === '/mcp' && (req.method === 'GET' || req.method === 'HEAD')) {
+                res.writeHead(200);
+                if (req.method === 'HEAD') {
+                    res.end();
+                } else {
+                    res.end(JSON.stringify({
+                        status: 'ok',
+                        endpoint: 'mcp',
+                        protocol: 'json-rpc-2.0',
+                        tools: this.toolsList.length
+                    }));
+                }
             } else if (pathname === '/health' && req.method === 'GET') {
                 res.writeHead(200);
                 res.end(JSON.stringify({ status: 'ok', tools: this.toolsList.length }));
@@ -226,6 +238,12 @@ export class MCPServer {
                 }
                 
                 const response = await this.handleMessage(message);
+                if (response === null) {
+                    res.writeHead(202);
+                    res.end();
+                    return;
+                }
+
                 res.writeHead(200);
                 res.end(JSON.stringify(response));
             } catch (error: any) {
@@ -243,18 +261,36 @@ export class MCPServer {
         });
     }
 
-    private async handleMessage(message: any): Promise<any> {
+    private async handleMessage(message: any): Promise<any | null> {
+        if (Array.isArray(message)) {
+            const responses = await Promise.all(message.map(item => this.handleSingleMessage(item)));
+            const responseMessages = responses.filter(response => response !== null);
+            return responseMessages.length > 0 ? responseMessages : null;
+        }
+
+        return await this.handleSingleMessage(message);
+    }
+
+    private async handleSingleMessage(message: any): Promise<any | null> {
+        const hasId = Object.prototype.hasOwnProperty.call(message, 'id');
         const { id, method, params } = message;
 
         try {
             let result: any;
 
             switch (method) {
+                case 'notifications/initialized':
+                case 'notifications/cancelled':
+                case 'notifications/progress':
+                    return hasId ? { jsonrpc: '2.0', id, result: {} } : null;
+                case 'ping':
+                    result = {};
+                    break;
                 case 'tools/list':
                     result = { tools: this.getAvailableTools() };
                     break;
                 case 'tools/call':
-                    const { name, arguments: args } = params;
+                    const { name, arguments: args } = params || {};
                     const toolResult = await this.executeToolCall(name, args);
                     result = { content: [{ type: 'text', text: JSON.stringify(toolResult) }] };
                     break;
@@ -272,7 +308,17 @@ export class MCPServer {
                     };
                     break;
                 default:
-                    throw new Error(`Unknown method: ${method}`);
+                    if (!hasId) {
+                        return null;
+                    }
+                    return {
+                        jsonrpc: '2.0',
+                        id,
+                        error: {
+                            code: -32601,
+                            message: `Method not found: ${method}`
+                        }
+                    };
             }
 
             return {
@@ -281,6 +327,10 @@ export class MCPServer {
                 result
             };
         } catch (error: any) {
+            if (!hasId) {
+                return null;
+            }
+
             return {
                 jsonrpc: '2.0',
                 id,
@@ -417,7 +467,7 @@ export class MCPServer {
         const sampleParams = this.generateSampleParams(schema);
         const jsonString = JSON.stringify(sampleParams, null, 2);
         
-        return `curl -X POST http://127.0.0.1:8585/api/${category}/${toolName} \\
+        return `curl -X POST http://127.0.0.1:${this.settings.port}/api/${category}/${toolName} \\
   -H "Content-Type: application/json" \\
   -d '${jsonString}'`;
     }
